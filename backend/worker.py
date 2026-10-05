@@ -7,16 +7,11 @@ from datetime import datetime, timezone
 import psycopg
 from psycopg.rows import dict_row
 
-from db import SCHEMA, connect
+from db import connect, ensure_schema
 from rules import judge
 
 POLL_SEC = float(os.environ.get("WORKER_POLL_SEC", "0.5"))
 IDLE_SEC = float(os.environ.get("WORKER_IDLE_SEC", "1.0"))
-
-
-def ensure_schema(conn):
-    conn.execute(SCHEMA)
-    conn.commit()
 
 
 def claim_and_process(conn) -> bool:
@@ -46,6 +41,7 @@ def main():
     print("yaw-align worker started", flush=True)
     with connect() as conn:
         ensure_schema(conn)
+        conn.commit()
     while True:
         try:
             with connect() as conn:
