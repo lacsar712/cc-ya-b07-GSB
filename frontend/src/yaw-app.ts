@@ -13,6 +13,26 @@ type LogRow = {
   processed_at: string | null;
 };
 
+type MergePreview = {
+  source_ids: number[];
+  source_count: number;
+  turbine_code: string;
+  verdict: string;
+  avg_yaw_err_deg: number;
+};
+
+type MergeRow = {
+  id: number;
+  new_log_id: number;
+  turbine_code: string;
+  verdict: string;
+  source_count: number;
+  avg_yaw_err_deg: number;
+  created_by: string;
+  created_at: string;
+  source_ids: number[];
+};
+
 type Session = {
   token: string;
   username: string;
@@ -61,6 +81,12 @@ export class YawAlignApp extends LitElement {
       background: #0f172a;
       color: #f1f5f9;
       margin-bottom: 0.75rem;
+    }
+    input[type="checkbox"] {
+      width: auto;
+      margin-bottom: 0;
+      transform: scale(1.25);
+      cursor: pointer;
     }
     button {
       cursor: pointer;
@@ -115,6 +141,18 @@ export class YawAlignApp extends LitElement {
       color: #f87171;
       margin-top: 0.5rem;
     }
+    .okmsg {
+      color: #86efac;
+      margin-top: 0.5rem;
+    }
+    .preview {
+      margin-top: 0.75rem;
+      padding: 0.6rem 0.75rem;
+      border: 1px dashed #38bdf8;
+      border-radius: 6px;
+      color: #bae6fd;
+      font-size: 0.9rem;
+    }
     .row-actions {
       display: flex;
       gap: 0.5rem;
@@ -131,6 +169,13 @@ export class YawAlignApp extends LitElement {
   @state() private yawErr = "";
   @state() private error = "";
   @state() private loading = false;
+  @state() private view: "logs" | "merge" = "logs";
+  @state() private merges: MergeRow[] = [];
+  @state() private selectedIds: number[] = [];
+  @state() private mergePreview: MergePreview | null = null;
+  @state() private mergeError = "";
+  @state() private mergeNotice = "";
+  @state() private mergeBusy = false;
 
   connectedCallback() {
     super.connectedCallback();
@@ -171,6 +216,18 @@ export class YawAlignApp extends LitElement {
       }
       if (!res.ok) return;
       this.logs = (await res.json()) as LogRow[];
+      void this.refreshMerges();
+    } catch {
+      /* ignore transient network errors */
+    }
+  }
+
+  private async refreshMerges() {
+    if (!this.session) return;
+    try {
+      const res = await fetch("/api/merges", { headers: this.authHeaders() });
+      if (!res.ok) return;
+      this.merges = (await res.json()) as MergeRow[];
     } catch {
       /* ignore transient network errors */
     }
@@ -212,11 +269,87 @@ export class YawAlignApp extends LitElement {
     if (this._pollTimer) clearInterval(this._pollTimer);
     this.session = null;
     this.logs = [];
+    this.merges = [];
+    this.view = "logs";
+    this.selectedIds = [];
+    this.mergePreview = null;
+    this.mergeError = "";
+    this.mergeNotice = "";
     localStorage.removeItem("yaw_session");
   }
 
   private get isWriter() {
     return this.session?.role === "writer";
+  }
+
+  private get doneLogs() {
+    return this.logs.filter((row) => row.status === "done");
+  }
+
+  private isSelected(id: number) {
+    return this.selectedIds.includes(id);
+  }
+
+  private toggleMergeSelect(id: number) {
+    this.selectedIds = this.isSelected(id)
+      ? this.selectedIds.filter((x) => x !== id)
+      : [...this.selectedIds, id];
+    // 勾选变化后旧预览作废，均值必须重新由后台计算
+    this.mergePreview = null;
+    this.mergeError = "";
+    this.mergeNotice = "";
+  }
+
+  private async previewMerge() {
+    this.mergeError = "";
+    this.mergeNotice = "";
+    this.mergeBusy = true;
+    try {
+      const res = await fetch("/api/merges/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...this.authHeaders() },
+        body: JSON.stringify({ log_ids: this.selectedIds }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        this.mergePreview = null;
+        this.mergeError = data.detail || "预览被拒收";
+        return;
+      }
+      this.mergePreview = data as MergePreview;
+    } catch {
+      this.mergeError = "预览时网络异常";
+    } finally {
+      this.mergeBusy = false;
+    }
+  }
+
+  private async enqueueMerge() {
+    this.mergeError = "";
+    this.mergeNotice = "";
+    this.mergeBusy = true;
+    try {
+      const res = await fetch("/api/merges", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...this.authHeaders() },
+        body: JSON.stringify({ log_ids: this.selectedIds }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        this.mergeError = data.detail || "入队被拒收";
+        return;
+      }
+      this.selectedIds = [];
+      this.mergePreview = null;
+      this.mergeNotice =
+        `已生成新待处理单 #${data.log.id}（后台均值 ${data.log.yaw_err_deg}°），` +
+        `合成流水 #${data.merge.id} 已一并记账`;
+      await this.refreshLogs();
+    } catch {
+      this.mergeError = "入队时网络异常";
+    } finally {
+      this.mergeBusy = false;
+    }
   }
 
   private async submitLog() {
@@ -256,46 +389,8 @@ export class YawAlignApp extends LitElement {
     return "";
   }
 
-  render() {
-    if (!this.session) {
-      return html`
-        <h1>风机偏航对中台</h1>
-        <p class="sub">现场技师提交偏航误差，后台 worker 认领后给出合格或偏航超差结论。</p>
-        <section>
-          <label>用户名</label>
-          <input
-            .value=${this.loginUser}
-            @input=${(e: Event) =>
-              (this.loginUser = (e.target as HTMLInputElement).value)}
-          />
-          <label>密码</label>
-          <input
-            type="password"
-            .value=${this.loginPass}
-            @input=${(e: Event) =>
-              (this.loginPass = (e.target as HTMLInputElement).value)}
-          />
-          <button ?disabled=${this.loading} @click=${this.login}>登录</button>
-          ${this.error ? html`<p class="err">${this.error}</p>` : null}
-        </section>
-      `;
-    }
-
+  private renderLogsPage() {
     return html`
-      <h1>风机偏航对中台</h1>
-      <p class="sub">
-        已登录：${this.session.username}
-        (${this.isWriter ? "可提交" : "只读"})
-      </p>
-      <section>
-        <div class="row-actions">
-          <button class="secondary" @click=${this.logout}>退出</button>
-          <button class="secondary" ?disabled=${this.loading} @click=${this.refreshLogs}>
-            刷新列表
-          </button>
-        </div>
-      </section>
-
       ${this.isWriter
         ? html`
             <section>
@@ -360,6 +455,180 @@ export class YawAlignApp extends LitElement {
           </tbody>
         </table>
       </section>
+    `;
+  }
+
+  private renderMergePage() {
+    const done = this.doneLogs;
+    return html`
+      <section>
+        <h2 style="margin-top:0;font-size:1.1rem;">多笔均值合成入队</h2>
+        <p class="sub" style="margin-bottom:0.75rem;">
+          勾选至少两笔同一结论类型的已办结记录，先预览后台均值再入队；
+          均值一律由后台计算，入队后生成新的待处理单。
+        </p>
+        ${done.length === 0
+          ? html`<p class="sub" style="margin-bottom:0;">暂无已办结记录可合成。</p>`
+          : html`
+              <table>
+                <thead>
+                  <tr>
+                    <th>勾选</th>
+                    <th>编号</th>
+                    <th>机组</th>
+                    <th>误差°</th>
+                    <th>结论</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${done.map(
+                    (row) => html`
+                      <tr>
+                        <td>
+                          <input
+                            type="checkbox"
+                            .checked=${this.isSelected(row.id)}
+                            @change=${() => this.toggleMergeSelect(row.id)}
+                          />
+                        </td>
+                        <td>${row.id}</td>
+                        <td>${row.turbine_code}</td>
+                        <td>${row.yaw_err_deg}</td>
+                        <td>
+                          <span class="tag ${this.verdictClass(row)}">${row.verdict}</span>
+                        </td>
+                      </tr>
+                    `
+                  )}
+                </tbody>
+              </table>
+              <div class="row-actions" style="margin-top:0.75rem;">
+                <span class="sub" style="margin:0;">已选 ${this.selectedIds.length} 笔</span>
+                <button
+                  ?disabled=${this.selectedIds.length < 2 || this.mergeBusy}
+                  @click=${this.previewMerge}
+                >
+                  预览均值
+                </button>
+                ${this.isWriter
+                  ? html`
+                      <button
+                        ?disabled=${this.selectedIds.length < 2 || this.mergeBusy}
+                        @click=${this.enqueueMerge}
+                      >
+                        确认入队
+                      </button>
+                    `
+                  : html`
+                      <span class="sub" style="margin:0;">
+                        观察员仅可预览，入队需现场技师账号
+                      </span>
+                    `}
+              </div>
+              ${this.mergePreview
+                ? html`
+                    <div class="preview">
+                      后台预览：${this.mergePreview.source_count} 笔「${this.mergePreview.verdict}」记录，
+                      均值 ${this.mergePreview.avg_yaw_err_deg}°，
+                      新单机组 ${this.mergePreview.turbine_code}，入队后状态为待处理。
+                    </div>
+                  `
+                : null}
+              ${this.mergeError ? html`<p class="err">${this.mergeError}</p>` : null}
+              ${this.mergeNotice ? html`<p class="okmsg">${this.mergeNotice}</p>` : null}
+            `}
+      </section>
+
+      <section>
+        <h2 style="margin-top:0;font-size:1.1rem;">合成流水</h2>
+        ${this.merges.length === 0
+          ? html`<p class="sub" style="margin-bottom:0;">暂无合成记录。</p>`
+          : html`
+              <table>
+                <thead>
+                  <tr>
+                    <th>流水号</th>
+                    <th>新单号</th>
+                    <th>来源编号</th>
+                    <th>笔数</th>
+                    <th>后台均值°</th>
+                    <th>结论类型</th>
+                    <th>操作人</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${this.merges.map(
+                    (merge) => html`
+                      <tr>
+                        <td>${merge.id}</td>
+                        <td>${merge.new_log_id}</td>
+                        <td>${merge.source_ids.join("、")}</td>
+                        <td>${merge.source_count}</td>
+                        <td>${merge.avg_yaw_err_deg}</td>
+                        <td>${merge.verdict}</td>
+                        <td>${merge.created_by}</td>
+                      </tr>
+                    `
+                  )}
+                </tbody>
+              </table>
+            `}
+      </section>
+    `;
+  }
+
+  render() {
+    if (!this.session) {
+      return html`
+        <h1>风机偏航对中台</h1>
+        <p class="sub">现场技师提交偏航误差，后台 worker 认领后给出合格或偏航超差结论。</p>
+        <section>
+          <label>用户名</label>
+          <input
+            .value=${this.loginUser}
+            @input=${(e: Event) =>
+              (this.loginUser = (e.target as HTMLInputElement).value)}
+          />
+          <label>密码</label>
+          <input
+            type="password"
+            .value=${this.loginPass}
+            @input=${(e: Event) =>
+              (this.loginPass = (e.target as HTMLInputElement).value)}
+          />
+          <button ?disabled=${this.loading} @click=${this.login}>登录</button>
+          ${this.error ? html`<p class="err">${this.error}</p>` : null}
+        </section>
+      `;
+    }
+
+    return html`
+      <h1>风机偏航对中台</h1>
+      <p class="sub">
+        已登录：${this.session.username}
+        (${this.isWriter ? "可提交" : "只读"})
+      </p>
+      <section>
+        <div class="row-actions">
+          <button class="secondary" @click=${this.logout}>退出</button>
+          <button class="secondary" ?disabled=${this.loading} @click=${this.refreshLogs}>
+            刷新列表
+          </button>
+          ${this.view === "logs"
+            ? html`
+                <button @click=${() => (this.view = "merge")}>
+                  多笔均值合成入队
+                </button>
+              `
+            : html`
+                <button @click=${() => (this.view = "logs")}>
+                  返回对中记录
+                </button>
+              `}
+        </div>
+      </section>
+
+      ${this.view === "merge" ? this.renderMergePage() : this.renderLogsPage()}
     `;
   }
 }

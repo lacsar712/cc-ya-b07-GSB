@@ -25,4 +25,21 @@ CREATE TABLE IF NOT EXISTS yaw_logs (
     created_at timestamptz NOT NULL,
     processed_at timestamptz
 );
+
+CREATE TABLE IF NOT EXISTS yaw_merges (
+    id serial PRIMARY KEY,
+    new_log_id integer NOT NULL REFERENCES yaw_logs(id),
+    turbine_code text NOT NULL,
+    verdict text NOT NULL,
+    source_count integer NOT NULL,
+    avg_yaw_err_deg double precision NOT NULL,
+    created_by text NOT NULL,
+    created_at timestamptz NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS yaw_merge_items (
+    merge_id integer NOT NULL REFERENCES yaw_merges(id) ON DELETE CASCADE,
+    log_id integer NOT NULL REFERENCES yaw_logs(id),
+    PRIMARY KEY (merge_id, log_id)
+);
 """
